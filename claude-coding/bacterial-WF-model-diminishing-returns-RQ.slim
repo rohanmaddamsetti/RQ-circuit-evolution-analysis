@@ -1,0 +1,477 @@
+/* bacterial-WF-model-diminishing-returns-RQ.slim
+by Rohan Maddamsetti
+last updated 02/06/2026 to work in SLiM 5.
+
+Wright-Fisher model of an idealized haploid bacterial genome
+ with diminishing-returns epistasis AND Red Queen (RQ) sigmoid
+ fitness transformation.
+
+ Diminishing returns follows the model of Wiser et al. (2013,
+ Science 342: 1364-1367) as implemented in the STEPS simulator
+ (Lake, Matson, & Lenski 2025).
+
+ When beneficial mutations accumulate in a lineage, the distribution
+  of fitness effects (DFE) for new beneficial mutations narrows,
+ causing the rate of adaptation to slow over time.
+
+ Key equation: alpha_{n+1} = alpha_n * (1 + g * s_{n+1})
+ where alpha = 1/(mean of beneficial DFE),
+       g = strength of diminishing returns epistasis,
+       s_{n+1} = selection coefficient of the newest mutation.
+
+ Fitness is multiplicative: W = product(1 + s_i) for all mutations i.
+
+ RED QUEEN SIGMOID TRANSFORMATION:
+ The RQ circuit applies a sigmoid transformation to effective fitness,
+ amplifying growth-rate differences within the population.
+
+ Transformation: w(r) = r / (1 + exp[-k * (r - r0)])
+ where r = ln(W) is the intrinsic growth rate,
+       r0 = ln(mean_W) is the population mean (adaptive threshold),
+       k = 6 controls sigmoid steepness.
+
+ Effective fitness = exp(w(r))
+
+ Conversions between selection coefficient s and growth rate r:
+   s = exp(r) - 1
+   r = ln(1 + s)
+
+*/
+
+initialize()
+{
+	if (exists("slimgui")) // if running with the SLiM GUI
+	{
+		defineConstant("Ne", 1e4); // effective population size
+		defineConstant("mu", 1e-9); // mutation rate per bp per generation.
+		defineConstant("numgens", 50000);
+		defineConstant("outfile", "SLiM-output-RQ-DR.csv");
+		defineConstant("subst_outfile", "SLiM-substitutions-RQ-DR.csv");
+	}
+
+	// LTEE parameters:
+	//Genome size = 4.62e6 base pairs
+	//Ne = 3.3e7 cells
+	//initial sb in LTEE = 0.01587 (Izutzu et al. 2021)
+	// mu = 8.9e-11 per base-pair per cell per generation,
+	// so mu = 0.00041118 = 4.11e-4 per cell per generation.
+
+	// STEPS simulation parameters (Izutzu et al. 2021):
+	// final population size, Nf = 5 x 10^8 cells;
+	// beneficial mutation rate, mu_B = 1.7 x 10^-6 per cell per generation
+	// mean effect size of beneficial mutations in the ancestor,
+	// s = 0.01587;
+	// and strength of diminishing-returns epistasis, g = 6.0217.
+
+	// ---- Diminishing-returns epistasis parameters ----
+	// Initial mean beneficial selection coefficient in the ancestor.
+	defineConstant("initial_mean_s", 0.01587);
+	// Strength of diminishing-returns epistasis.
+	defineConstant("g_epistasis", 6.0217);
+	// alpha_0 = inverse of the initial mean beneficial effect.
+	defineConstant("alpha_0", 1.0 / initial_mean_s);
+
+	// ---- Red Queen sigmoid transformation parameters ----
+	// Steepness of sigmoid transformation (k in the manuscript).
+	defineConstant("k_sigmoid", 6.0);
+
+	// ---- Mutation types ----
+	// m1: beneficial mutations drawn from an exponential distribution.
+	// The mutation() callback below overrides each new mutation's
+	// selection coefficient to implement diminishing returns.
+	initializeMutationType("m1", 1.0, "e", initial_mean_s);
+	// m2: strongly deleterious: 30% fitness defect (Robert et al. 2018)
+	initializeMutationType("m2", 1.0, "f", -0.3);
+	// m3: completely neutral
+	initializeMutationType("m3", 1.0, "f", 0.0);
+	// m4: nearly-neutral background: use -1*Beta(alpha=0.0074,beta=2.4),
+	// based on Lydia Robert et al. (2018) in Science.
+	// multiply by -1 since most mutations are weakly deleterious.
+	initializeMutationType("m4", 1.0, "s", "return -1*rbeta(1,0.0074,2.4);");
+
+	// CRITICAL: prevent SLiM from removing fixed m1 mutations.
+	// Fixed beneficial mutations must remain in haplosomes so
+	// the mutation() callback can include them when computing
+	// alpha for diminishing-returns epistasis.
+	m1.convertToSubstitution = F;
+	m2.convertToSubstitution = F;
+	m3.convertToSubstitution = F;
+	m4.convertToSubstitution = F;
+
+	m1.color = "green";
+	m1.colorSubstitution = "green";
+	m2.color = "red";
+	m2.colorSubstitution = "red";
+	m3.color = "yellow";
+	m3.colorSubstitution = "yellow";
+	m4.color = "orange";
+	m4.colorSubstitution = "orange";
+
+	// ---- Genomic DFE by region ----
+	// Module 1: 10% of mutations are beneficial.
+	initializeGenomicElementType("g1", c(m1,m4), c(0.1, 0.9));
+	// Module 2: 40% of mutations are strongly deleterious.
+	initializeGenomicElementType("g2", c(m2,m4), c(0.4, 0.6));
+	// Module 3: 100% of mutations are completely neutral.
+	initializeGenomicElementType("g3", m3, 1.0);
+	// Module 4: the rest of the genome has the DFE from Robert et al. (2018).
+	initializeGenomicElementType("g4", m4, 1.0);
+
+	g1.color = "green";
+	g2.color = "red";
+	g3.color = "yellow";
+	g4.color = "orange";
+
+	// Haploid genome of 4 million base pairs.
+	initializeChromosome(1, 4000000, type="H");
+	initializeGenomicElement(g1, 0, 99999);
+	initializeGenomicElement(g2, 100000, 199999);
+	initializeGenomicElement(g3, 200000, 299999);
+	initializeGenomicElement(g4, 300000, 3999999);
+
+	// LTEE point mutation rates per bp per genome per generation:
+	// Nonmutator ~ 1e-10;
+	// Hypermutator ~ 1e-8 (100x).
+	initializeMutationRate(mu);
+
+	// asexual bacterial evolution.
+	initializeRecombinationRate(0.0);
+}
+
+
+// ---- Diminishing-returns epistasis callback ----
+// When a new beneficial mutation (m1) arises, its selection coefficient
+// is redrawn from an exponential DFE whose mean depends on the
+// genetic background of the parent.
+//
+// 1. Compute alpha from all existing beneficial mutations on the
+//    parental haplosome: alpha = alpha_0 * product(1 + g * s_i).
+// 2. Optionally adjust alpha for deleterious mutations using
+//    STEPS equation 8: g* = g / (-g + |s| + 1).
+// 3. Draw new s from Exp(mean = 1/alpha) and assign it.
+//
+// As alpha increases, the mean beneficial effect (1/alpha) decreases,
+// producing diminishing returns over the course of adaptation.
+mutation(m1)
+{
+	// Start with the initial alpha.
+	alpha = alpha_0;
+
+	// --- Beneficial mutations increase alpha (narrow the DFE) ---
+	// 'haplosome' is the parental haplosome being copied.
+	existing_ben = haplosome.mutationsOfType(m1);
+	for (m in existing_ben)
+		alpha = alpha * (1.0 + g_epistasis * m.selectionCoeff);
+
+	// --- Deleterious mutations decrease alpha (widen the DFE) ---
+	// This uses the complementary epistasis model from STEPS:
+	// g* = g / (-g + |s| + 1)
+	// For typical g >> |s|, g* is negative, so deleterious mutations
+	// decrease alpha, reflecting that less-fit organisms have more
+	// room for beneficial improvement.
+	// Only m2 (strongly deleterious) is included; m4 mutations are
+	// near-neutral and have negligible effect on alpha.
+	existing_del = haplosome.mutationsOfType(m2);
+	for (m in existing_del)
+	{
+		s_mag = abs(m.selectionCoeff);
+		denom = -g_epistasis + s_mag + 1.0;
+		if (abs(denom) > 1e-10) // guard against division by zero
+		{
+			g_star = g_epistasis / denom;
+			factor = 1.0 + g_star * s_mag;
+			if (factor > 0.0) // guard against non-positive factor
+				alpha = alpha * factor;
+		}
+	}
+
+	// Ensure alpha is positive.
+	if (alpha <= 0.0)
+		alpha = alpha_0;
+
+	// Draw new selection coefficient from Exp(mean = 1/alpha).
+	// In Eidos, rexp() takes the mean parameter, not the rate.
+	new_mean_s = 1.0 / alpha;
+	new_s = rexp(1, new_mean_s);
+
+	// Override the mutation's selection coefficient.
+	mut.setSelectionCoeff(new_s);
+
+	return T;
+}
+
+
+// At the first generation, create a clonal population.
+1 early()
+{
+	sim.addSubpop("p1", asInteger(Ne));
+	p1.setCloningRate(1.0); // Essential for bacteria.
+
+	// if the outfile already exists,
+	// then delete it so we don't append
+	// new run data to old run data.
+	if (fileExists(outfile))
+		deleteFile(outfile);
+
+	// Write header line.
+	writeFile(outfile, "generation,mean_fitness,max_fitness,mean_intrinsic_fitness");
+
+	// Initialize substitutions output file.
+	if (fileExists(subst_outfile))
+		deleteFile(subst_outfile);
+
+	// Write header for substitutions file.
+	writeFile(subst_outfile, "fixation_gen,mutation_id,mutation_type,position,selection_coeff,origin_gen");
+
+	// Initialize a vector to track mutation IDs that have already been recorded as fixed.
+	sim.setValue("recorded_fixed_ids", integer(0));
+
+	// Initialize Red Queen threshold: r0 = ln(mean_W).
+	// At generation 1, all individuals have intrinsic fitness = 1.0,
+	// so r0 = ln(1) = 0.
+	sim.setValue("mean_r", 0.0);
+}
+
+
+// ---- Red Queen sigmoid fitness transformation ----
+// This callback transforms intrinsic fitness to effective fitness
+// using a sigmoid that tracks the population mean.
+//
+// w(r) = r / (1 + exp[-k * (r - r0)])
+// where r = ln(W_intrinsic), r0 = ln(mean_W), k = 6
+//
+// This amplifies fitness differences: individuals above the mean
+// retain most of their fitness advantage, while those below the
+// mean are heavily penalized.
+fitnessEffect()
+{
+	// Compute intrinsic fitness from mutations (multiplicative model).
+	// W = product(1 + s_i) for all mutations.
+	W_intrinsic = 1.0;
+
+	// For haploid individuals, access the single haplosome.
+	haplosome = individual.haplosomes[0];
+
+	for (mut in haplosome.mutations)
+		W_intrinsic = W_intrinsic * (1.0 + mut.selectionCoeff);
+
+	// Guard against non-positive fitness.
+	if (W_intrinsic <= 0.0)
+		W_intrinsic = 1e-10;
+
+	// Convert to growth rate: r = ln(W)
+	r = log(W_intrinsic);
+
+	// Get threshold from stored population mean: r0 = ln(mean_W)
+	r0 = sim.getValue("mean_r");
+
+	// Apply sigmoid transformation: w(r) = r / (1 + exp[-k(r - r0)])
+	sigmoid_denom = 1.0 + exp(-k_sigmoid * (r - r0));
+	w_r = r / sigmoid_denom;
+
+	// Convert back to effective fitness: W_effective = exp(w(r))
+	W_effective = exp(w_r);
+
+	return W_effective;
+}
+
+
+// ---- Update Red Queen threshold each generation ----
+// Compute mean intrinsic fitness and update r0 = ln(mean_W)
+// so the sigmoid threshold tracks the evolving population.
+1:numgens late()
+{
+	// Compute intrinsic fitness for each individual.
+	intrinsic_fitnesses = c();
+
+	for (ind in p1.individuals)
+	{
+		W = 1.0;
+		haplosome = ind.haplosomes[0];
+		for (mut in haplosome.mutations)
+			W = W * (1.0 + mut.selectionCoeff);
+		if (W <= 0.0)
+			W = 1e-10;
+		intrinsic_fitnesses = c(intrinsic_fitnesses, W);
+	}
+
+	mean_W_intrinsic = mean(intrinsic_fitnesses);
+
+	// Update threshold: r0 = ln(mean_W)
+	sim.setValue("mean_r", log(mean_W_intrinsic));
+}
+
+
+// max number of generations is 10,000.
+// cached fitnesses should be accessed at the first() or early() stage.
+// Note: cachedFitness returns EFFECTIVE fitness (after sigmoid transformation).
+1:numgens early()
+{
+	// Print progress every 100 generations.
+	if (sim.cycle % 100 == 0 | sim.cycle == 1)
+	{
+		// Effective fitness (after RQ sigmoid transformation).
+		fitnesses = p1.cachedFitness(NULL);
+		mean_w = mean(fitnesses);
+		max_w = max(fitnesses);
+
+		// Also compute mean intrinsic fitness (before sigmoid).
+		intrinsic_fitnesses = c();
+		for (ind in p1.individuals)
+		{
+			W = 1.0;
+			haplosome = ind.haplosomes[0];
+			for (mut in haplosome.mutations)
+				W = W * (1.0 + mut.selectionCoeff);
+			if (W <= 0.0)
+				W = 1e-10;
+			intrinsic_fitnesses = c(intrinsic_fitnesses, W);
+		}
+		mean_w_intrinsic = mean(intrinsic_fitnesses);
+
+		cat("Generation: " + sim.cycle +
+			" | Mean W (effective): " + format("%.6f", mean_w) +
+			" | Mean W (intrinsic): " + format("%.6f", mean_w_intrinsic) +
+			" | Max W: " + format("%.6f", max_w) + "\n");
+
+		// Write data to output file.
+		line = sim.cycle + "," + mean_w + "," + max_w + "," + mean_w_intrinsic;
+		writeFile(outfile, line, append=T);
+	}
+
+	// ---- Track fixed substitutions ----
+	// Check for newly fixed mutations and record them.
+	// A mutation is fixed when its frequency = 1.0 in the population.
+	recorded_ids = sim.getValue("recorded_fixed_ids");
+
+	// Get all mutations in the population and their frequencies.
+	all_muts = sim.mutations;
+	if (size(all_muts) > 0)
+	{
+		freqs = sim.mutationFrequencies(p1, all_muts);
+
+		// Find mutations that are fixed (frequency == 1.0).
+		fixed_indices = which(freqs == 1.0);
+
+		if (size(fixed_indices) > 0)
+		{
+			fixed_muts = all_muts[fixed_indices];
+
+			for (mut in fixed_muts)
+			{
+				// Check if this mutation has already been recorded.
+				if (sum(recorded_ids == mut.id) == 0)
+				{
+					// Determine mutation type string.
+					if (mut.mutationType == m1)
+						mut_type = "m1";
+					else if (mut.mutationType == m2)
+						mut_type = "m2";
+					else if (mut.mutationType == m3)
+						mut_type = "m3";
+					else
+						mut_type = "m4";
+
+					// Write to substitutions file.
+					line = sim.cycle + "," + mut.id + "," + mut_type + "," +
+						   mut.position + "," + mut.selectionCoeff + "," +
+						   mut.originTick;
+					writeFile(subst_outfile, line, append=T);
+
+					// Add to recorded IDs.
+					recorded_ids = c(recorded_ids, mut.id);
+				}
+			}
+
+			// Update the stored recorded IDs.
+			sim.setValue("recorded_fixed_ids", recorded_ids);
+		}
+	}
+
+	// run for numgens, where numgens <= 100,000.
+	if (sim.cycle == numgens)
+		sim.simulationFinished();
+}
+
+/* Implementation notes from Claude Code:
+
+=== DIMINISHING RETURNS EPISTASIS ===
+
+  Core mechanism: A mutation(m1) callback intercepts every new beneficial mutation at creation time and redraws its selection coefficient from a modified DFE based on the parent's genetic background.
+
+  Step-by-step:
+  1. When a new m1 mutation arises, the callback computes alpha from all existing beneficial mutations on the parental haplosome: alpha = alpha_0 * product(1 + g * s_i)
+  2. For any existing strongly deleterious mutations (m2), it applies the complementary STEPS formula (equation 8): g* = g / (-g + |s| + 1), which widens the DFE (decreasing alpha) to reflect that less-fit organisms have more room for improvement
+  3. A new selection coefficient is drawn from Exp(mean = 1/alpha) using rexp(1, 1.0/alpha)
+  4. The mutation's selection coefficient is overridden with mut.setSelectionCoeff(new_s)
+
+  Key design decisions:
+  - m1.convertToSubstitution = F keeps fixed beneficial mutations in haplosomes so they're counted in the alpha calculation
+  - The haplosome variable in the callback gives direct access to the parent's mutations (the genetic background)
+  - SLiM's default multiplicative fitness model (W = product(1 + s_i)) matches STEPS equation 2
+  - Numerical guards prevent alpha from going non-positive in edge cases
+
+  Parameters (from Izutsu et al. 2021 / STEPS defaults):
+  - Initial mean beneficial effect: s = 0.01587
+  - Epistasis strength: g = 6.0217
+
+
+=== RED QUEEN SIGMOID TRANSFORMATION ===
+
+  Based on Hamrick, Son, Maddamsetti et al. "Adversarial evolution of
+  Escherichia coli using a simple gene circuit."
+
+  Core mechanism: A fitness() callback transforms each individual's
+  intrinsic fitness (from mutations) into an effective fitness using
+  a sigmoid function. The sigmoid threshold tracks the population mean,
+  so it updates as the population adapts.
+
+  Sigmoid equation: w(r) = r / (1 + exp[-k * (r - r0)])
+  where:
+    r = ln(W_intrinsic) is the intrinsic growth rate
+    r0 = ln(mean_W) is the adaptive threshold (population mean)
+    k = 6 is the sigmoid steepness
+
+  Effective fitness: W_effective = exp(w(r))
+
+  Conversions between selection coefficient s and growth rate r:
+    s = exp(r) - 1  (growth rate to selection coefficient)
+    r = ln(1 + s)   (selection coefficient to growth rate)
+
+  Effect of the sigmoid:
+  - Individuals ABOVE the mean (r > r0): retain most of their fitness
+    advantage, as the sigmoid denominator approaches 1
+  - Individuals AT the mean (r = r0): w(r) = r/2, so their growth rate
+    is halved
+  - Individuals BELOW the mean (r < r0): heavily penalized, as the
+    sigmoid denominator becomes large
+
+  This amplifies the variance in effective fitness within the population,
+  accelerating adaptation according to Fisher's Fundamental Theorem:
+  d(mean_w)/dt = Var(w)
+
+  Implementation:
+  1. fitness(NULL) callback computes intrinsic W from mutations, then
+     applies sigmoid transformation to return effective fitness
+  2. late() callback computes mean intrinsic fitness and updates r0
+  3. early() callback logs both effective and intrinsic fitness
+
+  Output files:
+  - outfile (SLiM-output-RQ-DR.csv): logs fitness data every 100 generations
+  - subst_outfile (SLiM-substitutions-RQ-DR.csv): logs fixed substitutions when they reach 100% frequency
+
+  Fitness file columns:
+  - generation: simulation cycle
+  - mean_fitness: mean EFFECTIVE fitness (after sigmoid)
+  - max_fitness: max effective fitness
+  - mean_intrinsic_fitness: mean fitness before sigmoid transformation
+
+  Substitutions file columns:
+  - fixation_gen: generation when the mutation became fixed
+  - mutation_id: unique SLiM mutation ID
+  - mutation_type: m1 (beneficial), m2 (strongly deleterious), m3 (neutral), m4 (nearly-neutral)
+  - position: genomic position (0-based)
+  - selection_coeff: selection coefficient of the mutation
+  - origin_gen: generation when the mutation first arose
+
+*/
